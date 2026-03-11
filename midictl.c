@@ -121,41 +121,6 @@ struct data {
  * Config parsing
  * -------------------------------------------------------------------------- */
 
-/* Grab the string value from a spa_json iterator into buf[len].
- * Returns number of bytes written (without NUL), or < 0 on error. */
-static int json_get_string(struct spa_json *it, char *buf, size_t len)
-{
-    const char *val;
-    int vlen = spa_json_next(it, &val);
-    if (vlen <= 0)
-        return -1;
-    return spa_json_parse_stringn(val, vlen, buf, len);
-}
-
-/* Grab a double value from a spa_json iterator. */
-static int json_get_double(struct spa_json *it, double *out)
-{
-    const char *val;
-    int vlen = spa_json_next(it, &val);
-    if (vlen <= 0)
-        return -1;
-    float f;
-    if (spa_json_parse_float(val, vlen, &f) < 0)
-        return -1;
-    *out = (double)f;
-    return 0;
-}
-
-/* Grab an integer value from a spa_json iterator. */
-static int json_get_int(struct spa_json *it, int *out)
-{
-    const char *val;
-    int vlen = spa_json_next(it, &val);
-    if (vlen <= 0)
-        return -1;
-    return spa_json_parse_int(val, vlen, out);
-}
-
 static int load_config(const char *path, struct mapping *mappings, int max_mappings)
 {
     FILE *f = fopen(path, "r");
@@ -174,33 +139,25 @@ static int load_config(const char *path, struct mapping *mappings, int max_mappi
     struct spa_json root, arr, obj;
     spa_json_init(&root, buf, n);
 
-    /* Expect a top-level array */
-    const char *val;
-    int vlen = spa_json_next(&root, &val);
-    if (vlen <= 0 || !spa_json_is_array(val, vlen)) {
+    /* spa_json_enter_container does spa_json_next + spa_json_enter atomically.
+     * Never call spa_json_next on a container token and then spa_json_enter
+     * separately — by then iter->cur has moved past the opening bracket and
+     * enter would start the child at the wrong position. */
+    if (spa_json_enter_container(&root, &arr, '[') <= 0) {
         log_error("Config must be a JSON array");
         free(buf);
         return -1;
     }
-    /* Enter the array container */
-    spa_json_enter(&root, &arr);
 
     int count = 0;
     while (count < max_mappings) {
-        vlen = spa_json_next(&arr, &val);
-        if (vlen <= 0)
+        /* Enter each object element of the array */
+        if (spa_json_enter_container(&arr, &obj, '{') <= 0)
             break;
-        if (!spa_json_is_object(val, vlen)) {
-            log_warn("Skipping non-object element in config array");
-            continue;
-        }
 
         struct mapping *m = &mappings[count];
         memset(m, 0, sizeof(*m));
         m->node_id = SPA_ID_INVALID;
-
-        /* Enter the object container */
-        spa_json_enter(&arr, &obj);
 
         char key[64];
         bool have_channel = false, have_control = false,
@@ -209,21 +166,32 @@ static int load_config(const char *path, struct mapping *mappings, int max_mappi
 
         while (spa_json_get_string(&obj, key, sizeof(key)) > 0) {
             if (strcmp(key, "channel") == 0) {
-                if (json_get_int(&obj, &m->channel) == 0) have_channel = true;
+                if (spa_json_get_int(&obj, &m->channel) > 0) have_channel = true;
             } else if (strcmp(key, "control") == 0) {
-                if (json_get_int(&obj, &m->control) == 0) have_control = true;
+                if (spa_json_get_int(&obj, &m->control) > 0) have_control = true;
             } else if (strcmp(key, "node") == 0) {
-                if (json_get_string(&obj, m->node_name, sizeof(m->node_name)) > 0)
+                if (spa_json_get_string(&obj, m->node_name,
+                                        sizeof(m->node_name)) > 0)
                     have_node = true;
             } else if (strcmp(key, "param") == 0) {
-                if (json_get_string(&obj, m->param, sizeof(m->param)) > 0)
+                if (spa_json_get_string(&obj, m->param,
+                                        sizeof(m->param)) > 0)
                     have_param = true;
             } else if (strcmp(key, "min") == 0) {
-                if (json_get_double(&obj, &m->min) == 0) have_min = true;
+                float fv;
+                if (spa_json_get_float(&obj, &fv) > 0) {
+                    m->min = (double)fv;
+                    have_min = true;
+                }
             } else if (strcmp(key, "max") == 0) {
-                if (json_get_double(&obj, &m->max) == 0) have_max = true;
+                float fv;
+                if (spa_json_get_float(&obj, &fv) > 0) {
+                    m->max = (double)fv;
+                    have_max = true;
+                }
             } else {
                 /* skip unknown key's value */
+                const char *val;
                 spa_json_next(&obj, &val);
             }
         }
