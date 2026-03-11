@@ -25,6 +25,8 @@
 #include <string.h>
 
 #include <pipewire/pipewire.h>
+#include <spa/param/format.h>
+#include <spa/param/audio/format.h>
 #include <spa/control/control.h>
 #include <spa/param/props.h>
 #include <spa/pod/builder.h>
@@ -721,6 +723,18 @@ int main(int argc, char *argv[])
     pw_filter_add_listener(mpd.filter, &mpd.filter_listener,
                            &filter_events, &mpd);
 
+    /* Build an EnumFormat pod advertising "8 bit raw midi" so PipeWire can
+     * negotiate the format when linking to the Midi-Bridge port.
+     * The Midi-Bridge uses mediaType=application / mediaSubtype=control. */
+    uint8_t fmt_buf[512];
+    struct spa_pod_builder fmt_b = SPA_POD_BUILDER_INIT(fmt_buf, sizeof(fmt_buf));
+    const struct spa_pod *fmt_params[1];
+    fmt_params[0] = spa_pod_builder_add_object(
+        &fmt_b,
+        SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
+        SPA_FORMAT_mediaType,    SPA_POD_Id(SPA_MEDIA_TYPE_application),
+        SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_control));
+
     /* Add a MIDI input port */
     struct pw_properties *port_props =
         pw_properties_new(PW_KEY_FORMAT_DSP, "8 bit raw midi",
@@ -733,7 +747,7 @@ int main(int argc, char *argv[])
         PW_FILTER_PORT_FLAG_MAP_BUFFERS,
         0,
         port_props,
-        NULL, 0);
+        fmt_params, 1);
 
     if (!mpd.in_port) { log_error("Failed to add MIDI port"); return 1; }
 
