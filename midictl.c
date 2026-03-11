@@ -25,9 +25,11 @@
 #include <string.h>
 
 #include <pipewire/pipewire.h>
+#include <pipewire/filter.h>
 #include <spa/param/format.h>
-#include <spa/param/audio/format.h>
+#include <spa/param/buffers.h>
 #include <spa/control/control.h>
+#include <spa/control/ump-utils.h>
 #include <spa/param/props.h>
 #include <spa/pod/builder.h>
 #include <spa/pod/pod.h>
@@ -78,6 +80,14 @@ struct mapping {
     bool     prop_info_resolved;     /* have we queried PropInfo yet? */
 };
 
+/* Carries a parameter update from the RT process thread to the main loop */
+struct param_update {
+    struct pw_proxy *proxy;
+    char             param[MAX_PARAM_NAME];
+    float            value;
+    bool             is_param;
+};
+
 /* One tracked PipeWire node */
 struct node_info {
     uint32_t         id;
@@ -91,6 +101,7 @@ struct node_info {
 /* Top-level application state */
 struct data {
     struct pw_main_loop    *loop;
+    struct pw_loop         *pw_loop;    /* pw_main_loop_get_loop(loop), cached */
     struct pw_context      *context;
     struct pw_core         *core;
     struct spa_hook         core_listener;
@@ -234,8 +245,8 @@ static double scale_midi(int midi_val, double out_min, double out_max)
  * If is_param == true:   Props { params: [ "name", value ] }
  * If is_param == false:  Props { name: value }
  *
- * We use a float pod since PipeWire Props parameters are universally Float
- * in the plugin implementations we care about (LADSPA/LV2 via filter-chain).
+ * Must be called from the main loop thread. The RT process callback uses
+ * do_set_node_param_invoke via pw_loop_invoke to get here safely.
  */
 static void set_node_param(struct pw_proxy *proxy,
                            const char      *param_name,
@@ -247,34 +258,64 @@ static void set_node_param(struct pw_proxy *proxy,
     struct spa_pod_frame   f[2];
     struct spa_pod        *pod;
 
-    if (is_param) {
-        /* Props { params: [ "name", <Float> ] } */
-        spa_pod_builder_push_object(&b, &f[0],
-                                    SPA_TYPE_OBJECT_Props, SPA_PARAM_Props);
-        spa_pod_builder_prop(&b, SPA_PROP_params, 0);
-        spa_pod_builder_push_array(&b, &f[1]);
-        spa_pod_builder_string(&b, param_name);
-        spa_pod_builder_float(&b, value);
-        spa_pod_builder_pop(&b, &f[1]);
-        pod = spa_pod_builder_pop(&b, &f[0]);
-    } else {
-        /* Props { <named prop>: <Float> }
-         * The prop id for a named param that lives directly on Props
-         * (e.g. volume) is looked up via spa_props; but for our use-case
-         * the is_param=false path only applies to "volume" today, which
-         * maps to SPA_PROP_volume.  We just always use the params-array
-         * form here as a safe fallback since pw-cli accepts both. */
-        spa_pod_builder_push_object(&b, &f[0],
-                                    SPA_TYPE_OBJECT_Props, SPA_PARAM_Props);
-        spa_pod_builder_prop(&b, SPA_PROP_params, 0);
-        spa_pod_builder_push_array(&b, &f[1]);
-        spa_pod_builder_string(&b, param_name);
-        spa_pod_builder_float(&b, value);
-        spa_pod_builder_pop(&b, &f[1]);
-        pod = spa_pod_builder_pop(&b, &f[0]);
-    }
+    /* Props { params: [ "name", <Float> ] }
+     *
+     * Must use a Struct pod (heterogeneous), not an Array pod (homogeneous),
+     * because the params value is a sequence of alternating string/float pairs.
+     */
+    spa_pod_builder_push_object(&b, &f[0],
+                                SPA_TYPE_OBJECT_Props, SPA_PARAM_Props);
+    spa_pod_builder_prop(&b, SPA_PROP_params, 0);
+    spa_pod_builder_push_struct(&b, &f[1]);
+    spa_pod_builder_string(&b, param_name);
+    spa_pod_builder_float(&b, value);
+    spa_pod_builder_pop(&b, &f[1]);
+    pod = spa_pod_builder_pop(&b, &f[0]);
 
-    pw_node_set_param((struct pw_node *)proxy, SPA_PARAM_Props, 0, pod);
+    int res = pw_node_set_param((struct pw_node *)proxy, SPA_PARAM_Props, 0, pod);
+    if (verbose) {
+        fprintf(stderr, "[verbose] pw_node_set_param: res=%d (%s), pod size=%u\n",
+                res, spa_strerror(res), SPA_POD_SIZE(pod));
+        uint8_t *p = (uint8_t *)pod;
+        fprintf(stderr, "[verbose] pod bytes:");
+        for (uint32_t i = 0; i < SPA_POD_SIZE(pod) && i < 64; i++)
+            fprintf(stderr, " %02x", p[i]);
+        fprintf(stderr, "\n");
+    }
+}
+
+/* pw_loop_invoke callback — runs in the main loop thread */
+static int do_set_node_param_invoke(struct spa_loop *loop,
+                                    bool             async,
+                                    uint32_t         seq,
+                                    const void      *data,
+                                    size_t           size,
+                                    void            *user_data)
+{
+    (void)loop; (void)async; (void)seq; (void)size;
+    const struct param_update *u = data;
+    log_verbose("invoke: setting param='%s' value=%.4f on proxy %p",
+                u->param, u->value, (void *)u->proxy);
+    set_node_param(u->proxy, u->param, u->value, u->is_param);
+    return 0;
+}
+
+/* Called from the RT process thread — dispatches to main loop */
+static void schedule_node_param(struct pw_loop  *loop,
+                                struct pw_proxy *proxy,
+                                const char      *param_name,
+                                float            value,
+                                bool             is_param)
+{
+    struct param_update u;
+    u.proxy    = proxy;
+    u.value    = value;
+    u.is_param = is_param;
+    snprintf(u.param, sizeof(u.param), "%s", param_name);
+    int res = pw_loop_invoke(loop, do_set_node_param_invoke,
+                             SPA_ID_INVALID, &u, sizeof(u), false, NULL);
+    if (res < 0)
+        fprintf(stderr, "[error]   pw_loop_invoke failed: %s\n", spa_strerror(res));
 }
 
 /* --------------------------------------------------------------------------
@@ -537,40 +578,79 @@ static void on_filter_process(void *userdata, struct spa_io_position *pos)
 {
     struct midi_port_data *mpd = userdata;
     struct data           *d   = mpd->app;
+    (void)pos;
 
     struct pw_buffer *buf = pw_filter_dequeue_buffer(mpd->in_port);
     if (!buf)
         return;
 
     struct spa_buffer *sbuf = buf->buffer;
-    if (!sbuf->datas[0].data)
+    uint32_t chunk_size = sbuf->datas[0].chunk->size;
+
+    if (!sbuf->datas[0].data || chunk_size == 0)
         goto done;
 
-    struct spa_pod *pod = sbuf->datas[0].data;
+    /* The actual data starts at chunk->offset within the data pointer */
+    void *raw = SPA_PTROFF(sbuf->datas[0].data,
+                            sbuf->datas[0].chunk->offset, void);
+    struct spa_pod *pod = raw;
+
     if (!spa_pod_is_sequence(pod))
         goto done;
 
     struct spa_pod_control *c;
     SPA_POD_SEQUENCE_FOREACH((struct spa_pod_sequence *)pod, c) {
-        if (c->type != SPA_CONTROL_Midi)
+        uint8_t status, msg_type, channel, controller, value;
+        uint8_t midi[3];
+
+        if (c->type == SPA_CONTROL_Midi) {
+            uint8_t *raw = SPA_POD_BODY(&c->value);
+            uint32_t size = SPA_POD_BODY_SIZE(&c->value);
+
+            log_verbose("process: MIDI bytes=%u: %02x %02x %02x",
+                        size,
+                        size > 0 ? raw[0] : 0,
+                        size > 1 ? raw[1] : 0,
+                        size > 2 ? raw[2] : 0);
+
+            if (size < 3) continue;
+            midi[0] = raw[0];
+            midi[1] = raw[1];
+            midi[2] = raw[2];
+
+        } else if (c->type == SPA_CONTROL_UMP) {
+            uint32_t *ump  = SPA_POD_BODY(&c->value);
+            uint32_t  size = SPA_POD_BODY_SIZE(&c->value);
+            uint8_t   ev[8];
+
+            log_verbose("process: UMP bytes=%u: %02x %02x %02x %02x",
+                        size,
+                        size > 0 ? ((uint8_t*)ump)[0] : 0,
+                        size > 1 ? ((uint8_t*)ump)[1] : 0,
+                        size > 2 ? ((uint8_t*)ump)[2] : 0,
+                        size > 3 ? ((uint8_t*)ump)[3] : 0);
+
+            int ev_size = spa_ump_to_midi(ump, size, ev, sizeof(ev));
+            if (ev_size < 3) continue;
+
+            midi[0] = ev[0];
+            midi[1] = ev[1];
+            midi[2] = ev[2];
+
+        } else {
             continue;
+        }
 
-        uint8_t *midi = SPA_POD_BODY(&c->value);
-        uint32_t size  = SPA_POD_BODY_SIZE(&c->value);
-
-        if (size < 3)
-            continue;
-
-        uint8_t status     = midi[0];
-        uint8_t msg_type   = status & 0xF0;
-        uint8_t channel    = (status & 0x0F) + 1; /* make 1-based */
+        status     = midi[0];
+        msg_type   = status & 0xF0;
+        channel    = (status & 0x0F) + 1; /* make 1-based */
 
         /* We only care about Control Change (0xB0) */
         if (msg_type != 0xB0)
             continue;
 
-        uint8_t controller = midi[1];
-        uint8_t value      = midi[2];
+        controller = midi[1];
+        value      = midi[2];
 
         log_verbose("MIDI CC: channel=%u controller=%u value=%u",
                     channel, controller, value);
@@ -611,8 +691,8 @@ static void on_filter_process(void *userdata, struct spa_io_position *pos)
                             : "unresolved");
             }
 
-            set_node_param(ni->proxy, m->param, (float)scaled,
-                           m->prop_info_resolved ? m->is_param : true);
+            schedule_node_param(d->pw_loop, ni->proxy, m->param, (float)scaled,
+                                m->prop_info_resolved ? m->is_param : true);
         }
     }
 
@@ -620,9 +700,22 @@ done:
     pw_filter_queue_buffer(mpd->in_port, buf);
 }
 
+static void on_filter_state_changed(void *userdata,
+                                    enum pw_filter_state old,
+                                    enum pw_filter_state state,
+                                    const char *error)
+{
+    log_verbose("Filter state: %s -> %s%s%s",
+                pw_filter_state_as_string(old),
+                pw_filter_state_as_string(state),
+                error ? ": " : "",
+                error ? error : "");
+}
+
 static const struct pw_filter_events filter_events = {
     PW_VERSION_FILTER_EVENTS,
-    .process = on_filter_process,
+    .process       = on_filter_process,
+    .state_changed = on_filter_state_changed,
 };
 
 /* --------------------------------------------------------------------------
@@ -688,8 +781,9 @@ int main(int argc, char *argv[])
     d.n_mappings = n;
 
     /* Main loop + context + core */
-    d.loop = pw_main_loop_new(NULL);
+    d.loop    = pw_main_loop_new(NULL);
     if (!d.loop) { log_error("Failed to create main loop"); return 1; }
+    d.pw_loop = pw_main_loop_get_loop(d.loop);
     g_loop = d.loop;
 
     d.context = pw_context_new(pw_main_loop_get_loop(d.loop), NULL, 0);
@@ -708,13 +802,23 @@ int main(int argc, char *argv[])
     /* Sync so we get the initial graph snapshot before proceeding */
     d.pending_seq = pw_core_sync(d.core, PW_ID_CORE, 0);
 
-    /* MIDI filter node — receives MIDI CC from any connected source */
+    /* MIDI filter node.
+     *
+     * Use pw_filter_new (not pw_filter_new_simple) so the filter shares our
+     * existing core connection and participates in the same registry/loop.
+     *
+     * PW_KEY_MEDIA_CLASS "Midi/Sink" tells WirePlumber to assign a graph
+     * driver so that PW_FILTER_FLAG_RT_PROCESS fires.
+     *
+     * We pass both EnumFormat (application/control) and Buffers pods at
+     * port-add time so PipeWire can negotiate the link with Midi-Bridge.
+     */
     struct pw_properties *filter_props =
-        pw_properties_new(PW_KEY_MEDIA_TYPE,     "Midi",
-                          PW_KEY_MEDIA_CATEGORY, "Capture",
-                          PW_KEY_MEDIA_ROLE,     "Production",
-                          PW_KEY_NODE_NAME,      "midi-control",
-                          PW_KEY_NODE_DESCRIPTION, "MIDI Control Mapper",
+        pw_properties_new(PW_KEY_MEDIA_TYPE,        "Midi",
+                          PW_KEY_MEDIA_CATEGORY,    "Capture",
+                          PW_KEY_MEDIA_CLASS,       "Midi/Sink",
+                          PW_KEY_NODE_NAME,         "midi-control",
+                          PW_KEY_NODE_DESCRIPTION,  "MIDI Control Mapper",
                           NULL);
 
     mpd.filter = pw_filter_new(d.core, "midi-control", filter_props);
@@ -723,31 +827,32 @@ int main(int argc, char *argv[])
     pw_filter_add_listener(mpd.filter, &mpd.filter_listener,
                            &filter_events, &mpd);
 
-    /* Build an EnumFormat pod advertising "8 bit raw midi" so PipeWire can
-     * negotiate the format when linking to the Midi-Bridge port.
-     * The Midi-Bridge uses mediaType=application / mediaSubtype=control. */
-    uint8_t fmt_buf[512];
-    struct spa_pod_builder fmt_b = SPA_POD_BUILDER_INIT(fmt_buf, sizeof(fmt_buf));
-    const struct spa_pod *fmt_params[1];
-    fmt_params[0] = spa_pod_builder_add_object(
-        &fmt_b,
-        SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
+    /* Build port params: EnumFormat + Buffers in one pod array */
+    uint8_t pod_buf[1024];
+    struct spa_pod_builder pb = SPA_POD_BUILDER_INIT(pod_buf, sizeof(pod_buf));
+    const struct spa_pod *port_params[2];
+
+    port_params[0] = spa_pod_builder_add_object(&pb,
+        SPA_TYPE_OBJECT_Format,  SPA_PARAM_EnumFormat,
         SPA_FORMAT_mediaType,    SPA_POD_Id(SPA_MEDIA_TYPE_application),
         SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_control));
 
-    /* Add a MIDI input port */
-    struct pw_properties *port_props =
-        pw_properties_new(PW_KEY_FORMAT_DSP, "8 bit raw midi",
-                          PW_KEY_PORT_NAME,  "midi_in",
-                          NULL);
+    port_params[1] = spa_pod_builder_add_object(&pb,
+        SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+        SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(1, 1, 32),
+        SPA_PARAM_BUFFERS_blocks,  SPA_POD_Int(1),
+        SPA_PARAM_BUFFERS_size,    SPA_POD_CHOICE_RANGE_Int(4096, 4096, INT32_MAX),
+        SPA_PARAM_BUFFERS_stride,  SPA_POD_Int(1));
 
     mpd.in_port = pw_filter_add_port(
         mpd.filter,
         PW_DIRECTION_INPUT,
         PW_FILTER_PORT_FLAG_MAP_BUFFERS,
         0,
-        port_props,
-        fmt_params, 1);
+        pw_properties_new(PW_KEY_FORMAT_DSP, "8 bit raw midi",
+                          PW_KEY_PORT_NAME,  "midi_in",
+                          NULL),
+        port_params, 2);
 
     if (!mpd.in_port) { log_error("Failed to add MIDI port"); return 1; }
 
