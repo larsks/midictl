@@ -1,0 +1,8 @@
+# channel control node param lower_bound upper_bound
+1	23	gain.input	gain:Gain 1	0	10
+1	41	nr_mono.input	nr:bypass	0	1
+1	45	nr_mono.input	nr:Residual_listen	0	1
+1	16	nr_mono.input	nr:reduction	0	40
+1	17	nr_mono.input	nr:smoothing	0	100
+1	18	nr_mono.input	nr:suppression	0	100
+1	19	nr_mono.input	nr:tonal_reduction	0	48
