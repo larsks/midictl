@@ -1,118 +1,800 @@
+/* midi-control.c
+ *
+ * Listens for MIDI controller events via PipeWire and maps them to PipeWire
+ * node parameters according to a SPA-JSON configuration file.
+ *
+ * Config format (controls.json):
+ * [
+ *   { "channel": 1, "control": 23, "node": "gain.input",
+ *     "param": "gain:Gain 1", "min": 0.0, "max": 10.0 },
+ *   ...
+ * ]
+ *
+ * Build:
+ *   gcc $(pkg-config --cflags --libs libpipewire-0.3) -o midi-control midi-control.c
+ */
+
+#include <errno.h>
+#include <getopt.h>
+#include <math.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <signal.h>
+
 #include <pipewire/pipewire.h>
-#include <spa/param/audio/format-utils.h>
 #include <spa/control/control.h>
+#include <spa/param/props.h>
+#include <spa/pod/builder.h>
+#include <spa/pod/pod.h>
+#include <spa/utils/json.h>
+#include <spa/utils/result.h>
 
-#define MAX_MAPPINGS 128
+/* --------------------------------------------------------------------------
+ * Compile-time limits
+ * -------------------------------------------------------------------------- */
+#define MAX_MAPPINGS     256
+#define MAX_NODES        256
+#define MAX_PARAM_NAME   128
+#define MAX_NODE_NAME    128
+#define JSON_BUF_SIZE    65536
 
+/* --------------------------------------------------------------------------
+ * Logging helpers
+ * -------------------------------------------------------------------------- */
+static bool verbose = false;
+
+#define log_verbose(fmt, ...)                                   \
+    do {                                                        \
+        if (verbose)                                            \
+            fprintf(stderr, "[verbose] " fmt "\n", ##__VA_ARGS__); \
+    } while (0)
+
+#define log_info(fmt, ...)  fprintf(stderr, "[info]    " fmt "\n", ##__VA_ARGS__)
+#define log_warn(fmt, ...)  fprintf(stderr, "[warn]    " fmt "\n", ##__VA_ARGS__)
+#define log_error(fmt, ...) fprintf(stderr, "[error]   " fmt "\n", ##__VA_ARGS__)
+
+/* --------------------------------------------------------------------------
+ * Data structures
+ * -------------------------------------------------------------------------- */
+
+/* One entry from the JSON config file */
 struct mapping {
-    int channel;
-    int controller;
-    char node_name[128];
-    char param_name[128];
-    float lower_bound;
-    float upper_bound;
+    int    channel;                  /* MIDI channel (1-based) */
+    int    control;                  /* MIDI CC number */
+    char   node_name[MAX_NODE_NAME]; /* PipeWire node.name to target */
+    char   param[MAX_PARAM_NAME];    /* Parameter name, e.g. "nr:bypass" */
+    double min;                      /* Scaled output minimum */
+    double max;                      /* Scaled output maximum */
+
+    /* Resolved at runtime */
+    uint32_t node_id;                /* pw_node id, or SPA_ID_INVALID */
+    bool     is_param;               /* true  -> Props { params: ["name", val] }
+                                        false -> Props { name: val }           */
+    bool     prop_info_resolved;     /* have we queried PropInfo yet? */
 };
 
-struct data {
-    struct pw_main_loop *loop;
-    struct pw_context *context;
-    struct pw_core *core;
+/* One tracked PipeWire node */
+struct node_info {
+    uint32_t         id;
+    char             name[MAX_NODE_NAME];
     struct pw_proxy *proxy;
-    struct mapping mappings[MAX_MAPPINGS];
-    int mapping_count;
+    struct spa_hook  proxy_listener;
+    struct spa_hook  node_listener;
+    struct data     *data;           /* back-pointer */
 };
 
-static void do_quit(void *data, int signal_number) {
-    struct data *d = data;
-    pw_main_loop_quit(d->loop);
+/* Top-level application state */
+struct data {
+    struct pw_main_loop    *loop;
+    struct pw_context      *context;
+    struct pw_core         *core;
+    struct spa_hook         core_listener;
+
+    struct pw_registry     *registry;
+    struct spa_hook         registry_listener;
+
+    /* MIDI source port proxy */
+    struct pw_proxy        *midi_port_proxy;
+    struct spa_hook         midi_port_listener;
+    uint32_t                midi_port_id;   /* registry id of our MIDI port */
+    uint32_t                midi_node_id;   /* node that owns the port */
+
+    /* Port we create to receive MIDI */
+    struct pw_node         *capture_node;
+
+    /* Tracked graph nodes */
+    struct node_info        nodes[MAX_NODES];
+    int                     n_nodes;
+
+    /* Mappings loaded from config */
+    struct mapping          mappings[MAX_MAPPINGS];
+    int                     n_mappings;
+
+    /* Pending core sync */
+    int                     pending_seq;
+};
+
+/* --------------------------------------------------------------------------
+ * Config parsing
+ * -------------------------------------------------------------------------- */
+
+/* Grab the string value from a spa_json iterator into buf[len].
+ * Returns number of bytes written (without NUL), or < 0 on error. */
+static int json_get_string(struct spa_json *it, char *buf, size_t len)
+{
+    const char *val;
+    int vlen = spa_json_next(it, &val);
+    if (vlen <= 0)
+        return -1;
+    return spa_json_parse_stringn(val, vlen, buf, len);
 }
 
-// Logic to load the TSV file
-void load_mappings(struct data *d, const char *filename) {
-    FILE *f = fopen(filename, "r");
+/* Grab a double value from a spa_json iterator. */
+static int json_get_double(struct spa_json *it, double *out)
+{
+    const char *val;
+    int vlen = spa_json_next(it, &val);
+    if (vlen <= 0)
+        return -1;
+    float f;
+    if (spa_json_parse_float(val, vlen, &f) < 0)
+        return -1;
+    *out = (double)f;
+    return 0;
+}
+
+/* Grab an integer value from a spa_json iterator. */
+static int json_get_int(struct spa_json *it, int *out)
+{
+    const char *val;
+    int vlen = spa_json_next(it, &val);
+    if (vlen <= 0)
+        return -1;
+    return spa_json_parse_int(val, vlen, out);
+}
+
+static int load_config(const char *path, struct mapping *mappings, int max_mappings)
+{
+    FILE *f = fopen(path, "r");
     if (!f) {
-        perror("Failed to open mapping file");
-        exit(1);
+        log_error("Cannot open config file '%s': %s", path, strerror(errno));
+        return -1;
     }
 
-    char line[512];
-    d->mapping_count = 0;
-    while (fgets(line, sizeof(line), f) && d->mapping_count < MAX_MAPPINGS) {
-        if (line[0] == '#' || line[0] == '\n') continue;
-        
-        struct mapping *m = &d->mappings[d->mapping_count];
-        // Note: Using %[^\t] to handle spaces inside tab-separated columns
-        if (sscanf(line, "%d\t%d\t%[^\t]\t%[^\t]\t%f\t%f",
-                   &m->channel, &m->controller, m->node_name, 
-                   m->param_name, &m->lower_bound, &m->upper_bound) == 6) {
-            d->mapping_count++;
+    char *buf = malloc(JSON_BUF_SIZE);
+    if (!buf) { fclose(f); return -1; }
+
+    size_t n = fread(buf, 1, JSON_BUF_SIZE - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+
+    struct spa_json root, arr, obj;
+    spa_json_init(&root, buf, n);
+
+    /* Expect a top-level array */
+    const char *val;
+    int vlen = spa_json_next(&root, &val);
+    if (vlen <= 0 || !spa_json_is_array(val, vlen)) {
+        log_error("Config must be a JSON array");
+        free(buf);
+        return -1;
+    }
+    /* Enter the array container */
+    spa_json_enter(&root, &arr);
+
+    int count = 0;
+    while (count < max_mappings) {
+        vlen = spa_json_next(&arr, &val);
+        if (vlen <= 0)
+            break;
+        if (!spa_json_is_object(val, vlen)) {
+            log_warn("Skipping non-object element in config array");
+            continue;
+        }
+
+        struct mapping *m = &mappings[count];
+        memset(m, 0, sizeof(*m));
+        m->node_id = SPA_ID_INVALID;
+
+        /* Enter the object container */
+        spa_json_enter(&arr, &obj);
+
+        char key[64];
+        bool have_channel = false, have_control = false,
+             have_node    = false, have_param   = false,
+             have_min     = false, have_max     = false;
+
+        while (spa_json_get_string(&obj, key, sizeof(key)) > 0) {
+            if (strcmp(key, "channel") == 0) {
+                if (json_get_int(&obj, &m->channel) == 0) have_channel = true;
+            } else if (strcmp(key, "control") == 0) {
+                if (json_get_int(&obj, &m->control) == 0) have_control = true;
+            } else if (strcmp(key, "node") == 0) {
+                if (json_get_string(&obj, m->node_name, sizeof(m->node_name)) > 0)
+                    have_node = true;
+            } else if (strcmp(key, "param") == 0) {
+                if (json_get_string(&obj, m->param, sizeof(m->param)) > 0)
+                    have_param = true;
+            } else if (strcmp(key, "min") == 0) {
+                if (json_get_double(&obj, &m->min) == 0) have_min = true;
+            } else if (strcmp(key, "max") == 0) {
+                if (json_get_double(&obj, &m->max) == 0) have_max = true;
+            } else {
+                /* skip unknown key's value */
+                spa_json_next(&obj, &val);
+            }
+        }
+
+        if (!have_channel || !have_control || !have_node ||
+            !have_param   || !have_min     || !have_max) {
+            log_warn("Skipping incomplete mapping entry (need channel, control, "
+                     "node, param, min, max)");
+            continue;
+        }
+
+        log_verbose("Loaded mapping: ch=%d cc=%d node='%s' param='%s' "
+                    "min=%.4f max=%.4f",
+                    m->channel, m->control, m->node_name, m->param,
+                    m->min, m->max);
+        count++;
+    }
+
+    free(buf);
+    log_info("Loaded %d mapping(s) from '%s'", count, path);
+    return count;
+}
+
+/* --------------------------------------------------------------------------
+ * Value scaling
+ * -------------------------------------------------------------------------- */
+static double scale_midi(int midi_val, double out_min, double out_max)
+{
+    return out_min + (out_max - out_min) * (midi_val / 127.0);
+}
+
+/* --------------------------------------------------------------------------
+ * Parameter setting via libpipewire
+ * -------------------------------------------------------------------------- */
+
+/* Build and send a Props pod to set a single parameter on a node proxy.
+ *
+ * If is_param == true:   Props { params: [ "name", value ] }
+ * If is_param == false:  Props { name: value }
+ *
+ * We use a float pod since PipeWire Props parameters are universally Float
+ * in the plugin implementations we care about (LADSPA/LV2 via filter-chain).
+ */
+static void set_node_param(struct pw_proxy *proxy,
+                           const char      *param_name,
+                           float            value,
+                           bool             is_param)
+{
+    uint8_t buf[512];
+    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+    struct spa_pod_frame   f[2];
+    struct spa_pod        *pod;
+
+    if (is_param) {
+        /* Props { params: [ "name", <Float> ] } */
+        spa_pod_builder_push_object(&b, &f[0],
+                                    SPA_TYPE_OBJECT_Props, SPA_PARAM_Props);
+        spa_pod_builder_prop(&b, SPA_PROP_params, 0);
+        spa_pod_builder_push_array(&b, &f[1]);
+        spa_pod_builder_string(&b, param_name);
+        spa_pod_builder_float(&b, value);
+        spa_pod_builder_pop(&b, &f[1]);
+        pod = spa_pod_builder_pop(&b, &f[0]);
+    } else {
+        /* Props { <named prop>: <Float> }
+         * The prop id for a named param that lives directly on Props
+         * (e.g. volume) is looked up via spa_props; but for our use-case
+         * the is_param=false path only applies to "volume" today, which
+         * maps to SPA_PROP_volume.  We just always use the params-array
+         * form here as a safe fallback since pw-cli accepts both. */
+        spa_pod_builder_push_object(&b, &f[0],
+                                    SPA_TYPE_OBJECT_Props, SPA_PARAM_Props);
+        spa_pod_builder_prop(&b, SPA_PROP_params, 0);
+        spa_pod_builder_push_array(&b, &f[1]);
+        spa_pod_builder_string(&b, param_name);
+        spa_pod_builder_float(&b, value);
+        spa_pod_builder_pop(&b, &f[1]);
+        pod = spa_pod_builder_pop(&b, &f[0]);
+    }
+
+    pw_node_set_param((struct pw_node *)proxy, SPA_PARAM_Props, 0, pod);
+}
+
+/* --------------------------------------------------------------------------
+ * PropInfo querying: resolve is_param for a mapping
+ * -------------------------------------------------------------------------- */
+
+/* Temporary state used while enumerating PropInfo */
+struct propinfo_query {
+    const char *param_name;
+    bool        found;
+    bool        is_param;
+};
+
+static void on_node_param(void *data,
+                          int seq,
+                          uint32_t id,
+                          uint32_t index,
+                          uint32_t next,
+                          const struct spa_pod *param)
+{
+    /* We only care about PropInfo pods */
+    if (id != SPA_PARAM_PropInfo || param == NULL)
+        return;
+
+    struct node_info      *ni = data;
+    struct data           *d  = ni->data;
+
+    /* Iterate over all unresolved mappings for this node */
+    for (int i = 0; i < d->n_mappings; i++) {
+        struct mapping *m = &d->mappings[i];
+        if (m->node_id != ni->id)    continue;
+        if (m->prop_info_resolved)   continue;
+
+        /* Parse the PropInfo pod to extract name and params flag */
+        const char *name   = NULL;
+        bool        is_par = false;
+
+        struct spa_pod_prop *prop;
+        SPA_POD_OBJECT_FOREACH((struct spa_pod_object *)param, prop) {
+            if (prop->key == SPA_PROP_INFO_name) {
+                if (spa_pod_get_string(&prop->value, &name) < 0)
+                    name = NULL;
+            } else if (prop->key == SPA_PROP_INFO_params) {
+                bool v = false;
+                if (spa_pod_get_bool(&prop->value, &v) >= 0)
+                    is_par = v;
+            }
+        }
+
+        if (name && strcmp(name, m->param) == 0) {
+            m->is_param            = is_par;
+            m->prop_info_resolved  = true;
+            log_verbose("Resolved PropInfo for '%s' on node %u: is_param=%s",
+                        m->param, ni->id, is_par ? "true" : "false");
         }
     }
-    fclose(f);
 }
 
-// Function to send the parameter update to PipeWire
-static void update_param(struct data *d, struct mapping *m, float value) {
-    float scaled = m->lower_bound + (m->upper_bound - m->lower_bound) * (value / 127.0f);
-    
-    printf("Setting %s : %s to %f\n", m->node_name, m->param_name, scaled);
-    
-    // In a full implementation, you would look up the Node ID via pw_registry
-    // and use pw_node_set_param. 
-    // For simplicity and matching your pw-set-param helper:
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "pw-set-param %s \"%s\" %f", m->node_name, m->param_name, scaled);
-    system(cmd); 
+/* --------------------------------------------------------------------------
+ * Node lifecycle
+ * -------------------------------------------------------------------------- */
+
+static const struct pw_node_events node_events = {
+    PW_VERSION_NODE_EVENTS,
+    .param = on_node_param,
+};
+
+static void on_proxy_removed(void *data)
+{
+    struct node_info *ni = data;
+    log_verbose("Node %u ('%s') proxy removed", ni->id, ni->name);
+    pw_proxy_destroy(ni->proxy);
 }
 
-/* * NOTE: For maximum performance, we should use pw_registry to bind to the 
- * specific node objects. However, executing the logic via a single 
- * C loop already removes the MIDI parsing overhead significantly.
- */
+static void on_proxy_destroy(void *data)
+{
+    struct node_info *ni = data;
+    struct data      *d  = ni->data;
 
-int main(int argc, char *argv[]) {
-    struct data data = { 0 };
-    pw_init(&argc, &argv);
+    /* Capture id/name before we invalidate the slot */
+    uint32_t dead_id = ni->id;
+    char     dead_name[MAX_NODE_NAME];
+    snprintf(dead_name, sizeof(dead_name), "%s", ni->name);
 
-    data.loop = pw_main_loop_new(NULL);
-    pw_loop_add_signal(pw_main_loop_get_loop(data.loop), SIGINT, do_quit, &data);
-    
-    load_mappings(&data, "controls.tab");
+    /* Remove spa_hooks while ni is still valid */
+    spa_hook_remove(&ni->proxy_listener);
+    spa_hook_remove(&ni->node_listener);
 
-    // This section would typically initialize a MIDI input port.
-    // However, PipeWire's C API for MIDI is extensive. 
-    // To get you running immediately without 300 lines of boilerplate:
-    
-    printf("Monitoring MIDI events for %d mappings...\n", data.mapping_count);
+    /* Invalidate all mappings that referenced this node */
+    for (int i = 0; i < d->n_mappings; i++) {
+        if (d->mappings[i].node_id == dead_id) {
+            d->mappings[i].node_id           = SPA_ID_INVALID;
+            d->mappings[i].prop_info_resolved = false;
+            log_verbose("Mapping ch=%d cc=%d unlinked from node %u (destroyed)",
+                        d->mappings[i].channel, d->mappings[i].control, dead_id);
+        }
+    }
 
-    // Because pw-mididump is already efficient at capturing, 
-    // we can pipe it into this C program to handle the logic natively.
-    
-    char line[1024];
-    while (fgets(line, sizeof(line), stdin)) {
-        int chan, ctrl, val;
-        // Parse the mididump output format
-        if (strstr(line, "Controller")) {
-            char *p = strstr(line, "channel");
-            if (p) sscanf(p, "channel %d", &chan);
-            p = strstr(line, "controller");
-            if (p) sscanf(p, "controller %d", &ctrl);
-            p = strstr(line, "value");
-            if (p) sscanf(p, "value %d", &val);
+    /* Swap-remove from node table — safe because ni is no longer used after */
+    for (int i = 0; i < d->n_nodes; i++) {
+        if (d->nodes[i].id == dead_id) {
+            d->nodes[i] = d->nodes[--d->n_nodes];
+            break;
+        }
+    }
 
-            for (int i = 0; i < data.mapping_count; i++) {
-                if (data.mappings[i].channel == chan && data.mappings[i].controller == ctrl) {
-                    update_param(&data, &data.mappings[i], (float)val);
+    log_verbose("Node %u ('%s') destroyed and removed from table",
+                dead_id, dead_name);
+}
+
+static const struct pw_proxy_events proxy_events = {
+    PW_VERSION_PROXY_EVENTS,
+    .removed = on_proxy_removed,
+    .destroy  = on_proxy_destroy,
+};
+
+/* Bind to a newly discovered node, wire up listeners, and resolve mappings */
+static void bind_node(struct data *d, uint32_t id, const char *name)
+{
+    if (d->n_nodes >= MAX_NODES) {
+        log_warn("Node table full, ignoring node %u ('%s')", id, name);
+        return;
+    }
+
+    struct node_info *ni = &d->nodes[d->n_nodes++];
+    memset(ni, 0, sizeof(*ni));
+    ni->id   = id;
+    ni->data = d;
+    snprintf(ni->name, sizeof(ni->name), "%s", name);
+
+    ni->proxy = pw_registry_bind(d->registry, id,
+                                 PW_TYPE_INTERFACE_Node,
+                                 PW_VERSION_NODE, 0);
+    if (!ni->proxy) {
+        log_warn("Failed to bind proxy for node %u", id);
+        d->n_nodes--;
+        return;
+    }
+
+    pw_proxy_add_listener(ni->proxy, &ni->proxy_listener,
+                          &proxy_events, ni);
+    pw_node_add_listener((struct pw_node *)ni->proxy,
+                         &ni->node_listener, &node_events, ni);
+
+    log_verbose("Bound node %u ('%s')", id, name);
+
+    /* Resolve any mappings waiting for this node name */
+    bool any = false;
+    for (int i = 0; i < d->n_mappings; i++) {
+        struct mapping *m = &d->mappings[i];
+        if (strcmp(m->node_name, name) == 0) {
+            m->node_id           = id;
+            m->prop_info_resolved = false;
+            any = true;
+            log_info("Mapping ch=%d cc=%d now linked to node %u ('%s')",
+                     m->channel, m->control, id, name);
+        }
+    }
+
+    if (any) {
+        /* Enumerate PropInfo so we can resolve is_param */
+        pw_node_enum_params((struct pw_node *)ni->proxy,
+                            0, SPA_PARAM_PropInfo, 0, UINT32_MAX, NULL);
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Registry events
+ * -------------------------------------------------------------------------- */
+
+static void on_registry_global(void            *data,
+                                uint32_t         id,
+                                uint32_t         permissions,
+                                const char      *type,
+                                uint32_t         version,
+                                const struct spa_dict *props)
+{
+    struct data *d = data;
+
+    if (strcmp(type, PW_TYPE_INTERFACE_Node) != 0)
+        return;
+
+    const char *name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+    if (!name)
+        return;
+
+    log_verbose("Registry: node %u appeared: '%s'", id, name);
+
+    /* Check if any mapping cares about this node */
+    bool wanted = false;
+    for (int i = 0; i < d->n_mappings; i++) {
+        if (strcmp(d->mappings[i].node_name, name) == 0) {
+            wanted = true;
+            break;
+        }
+    }
+
+    if (wanted)
+        bind_node(d, id, name);
+}
+
+static void on_registry_global_remove(void *data, uint32_t id)
+{
+    /* Handled via proxy_destroy callback */
+    (void)data; (void)id;
+}
+
+static const struct pw_registry_events registry_events = {
+    PW_VERSION_REGISTRY_EVENTS,
+    .global        = on_registry_global,
+    .global_remove = on_registry_global_remove,
+};
+
+/* --------------------------------------------------------------------------
+ * Core sync — used to wait for the initial registry snapshot
+ * -------------------------------------------------------------------------- */
+
+static void on_core_done(void *data, uint32_t id, int seq)
+{
+    struct data *d = data;
+    if (id == PW_ID_CORE && seq == d->pending_seq) {
+        /* Initial sync complete — warn about any still-unresolved mappings */
+        for (int i = 0; i < d->n_mappings; i++) {
+            struct mapping *m = &d->mappings[i];
+            if (m->node_id == SPA_ID_INVALID)
+                log_warn("Node '%s' not found in graph (will activate if it "
+                         "appears later)", m->node_name);
+        }
+    }
+}
+
+static void on_core_error(void *data, uint32_t id, int seq,
+                          int res, const char *message)
+{
+    struct data *d = data;
+    log_error("Core error: id=%u seq=%d res=%d (%s): %s",
+              id, seq, res, spa_strerror(res), message);
+    if (id == PW_ID_CORE)
+        pw_main_loop_quit(d->loop);
+}
+
+static const struct pw_core_events core_events = {
+    PW_VERSION_CORE_EVENTS,
+    .done  = on_core_done,
+    .error = on_core_error,
+};
+
+/* --------------------------------------------------------------------------
+ * MIDI handling via a filter node
+ * -------------------------------------------------------------------------- */
+
+struct midi_port_data {
+    struct data *app;
+    struct pw_filter *filter;
+    struct spa_hook   filter_listener;
+    void             *in_port;  /* input MIDI port handle */
+};
+
+static void on_filter_process(void *userdata, struct spa_io_position *pos)
+{
+    struct midi_port_data *mpd = userdata;
+    struct data           *d   = mpd->app;
+
+    struct pw_buffer *buf = pw_filter_dequeue_buffer(mpd->in_port);
+    if (!buf)
+        return;
+
+    struct spa_buffer *sbuf = buf->buffer;
+    if (!sbuf->datas[0].data)
+        goto done;
+
+    struct spa_pod *pod = sbuf->datas[0].data;
+    if (!spa_pod_is_sequence(pod))
+        goto done;
+
+    struct spa_pod_control *c;
+    SPA_POD_SEQUENCE_FOREACH((struct spa_pod_sequence *)pod, c) {
+        if (c->type != SPA_CONTROL_Midi)
+            continue;
+
+        uint8_t *midi = SPA_POD_BODY(&c->value);
+        uint32_t size  = SPA_POD_BODY_SIZE(&c->value);
+
+        if (size < 3)
+            continue;
+
+        uint8_t status     = midi[0];
+        uint8_t msg_type   = status & 0xF0;
+        uint8_t channel    = (status & 0x0F) + 1; /* make 1-based */
+
+        /* We only care about Control Change (0xB0) */
+        if (msg_type != 0xB0)
+            continue;
+
+        uint8_t controller = midi[1];
+        uint8_t value      = midi[2];
+
+        log_verbose("MIDI CC: channel=%u controller=%u value=%u",
+                    channel, controller, value);
+
+        /* Find matching mappings */
+        for (int i = 0; i < d->n_mappings; i++) {
+            struct mapping *m = &d->mappings[i];
+
+            if (m->channel != (int)channel || m->control != (int)controller)
+                continue;
+
+            if (m->node_id == SPA_ID_INVALID) {
+                log_verbose("No node for mapping ch=%d cc=%d yet, skipping",
+                            m->channel, m->control);
+                continue;
+            }
+
+            /* Find the node_info for this mapping */
+            struct node_info *ni = NULL;
+            for (int j = 0; j < d->n_nodes; j++) {
+                if (d->nodes[j].id == m->node_id) {
+                    ni = &d->nodes[j];
                     break;
                 }
             }
+            if (!ni) continue;
+
+            double scaled = scale_midi(value, m->min, m->max);
+
+            if (verbose) {
+                fprintf(stderr,
+                        "[verbose] ch=%d cc=%d val=%d -> node='%s' "
+                        "param='%s' scaled=%.4f (is_param=%s)\n",
+                        m->channel, m->control, value,
+                        m->node_name, m->param, scaled,
+                        m->prop_info_resolved
+                            ? (m->is_param ? "true" : "false")
+                            : "unresolved");
+            }
+
+            set_node_param(ni->proxy, m->param, (float)scaled,
+                           m->prop_info_resolved ? m->is_param : true);
         }
     }
 
-    pw_main_loop_destroy(data.loop);
+done:
+    pw_filter_queue_buffer(mpd->in_port, buf);
+}
+
+static const struct pw_filter_events filter_events = {
+    PW_VERSION_FILTER_EVENTS,
+    .process = on_filter_process,
+};
+
+/* --------------------------------------------------------------------------
+ * Signal handling
+ * -------------------------------------------------------------------------- */
+static struct pw_main_loop *g_loop = NULL;
+
+static void handle_signal(int sig)
+{
+    (void)sig;
+    if (g_loop)
+        pw_main_loop_quit(g_loop);
+}
+
+/* --------------------------------------------------------------------------
+ * Usage / main
+ * -------------------------------------------------------------------------- */
+static void usage(const char *prog)
+{
+    fprintf(stderr,
+            "Usage: %s [OPTIONS] [config-file]\n"
+            "\n"
+            "Listen for MIDI CC events and map them to PipeWire node parameters.\n"
+            "\n"
+            "Options:\n"
+            "  -v, --verbose     Print diagnostic information\n"
+            "  -h, --help        Show this help\n"
+            "\n"
+            "config-file defaults to 'controls.json'\n",
+            prog);
+}
+
+int main(int argc, char *argv[])
+{
+    static const struct option long_opts[] = {
+        { "verbose", no_argument, NULL, 'v' },
+        { "help",    no_argument, NULL, 'h' },
+        { NULL, 0, NULL, 0 }
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "vh", long_opts, NULL)) != -1) {
+        switch (opt) {
+        case 'v': verbose = true; break;
+        case 'h': usage(argv[0]); return 0;
+        default:  usage(argv[0]); return 1;
+        }
+    }
+
+    const char *config_path = (optind < argc) ? argv[optind] : "controls.json";
+
+    /* ------------------------------------------------------------------ */
+    pw_init(&argc, &argv);
+    log_verbose("PipeWire version: %s", pw_get_library_version());
+
+    struct data            d   = { 0 };
+    struct midi_port_data  mpd = { 0 };
+    mpd.app = &d;
+
+    /* Load config */
+    int n = load_config(config_path, d.mappings, MAX_MAPPINGS);
+    if (n < 0) return 1;
+    d.n_mappings = n;
+
+    /* Main loop + context + core */
+    d.loop = pw_main_loop_new(NULL);
+    if (!d.loop) { log_error("Failed to create main loop"); return 1; }
+    g_loop = d.loop;
+
+    d.context = pw_context_new(pw_main_loop_get_loop(d.loop), NULL, 0);
+    if (!d.context) { log_error("Failed to create context"); return 1; }
+
+    d.core = pw_context_connect(d.context, NULL, 0);
+    if (!d.core) { log_error("Failed to connect to PipeWire daemon"); return 1; }
+
+    pw_core_add_listener(d.core, &d.core_listener, &core_events, &d);
+
+    /* Registry */
+    d.registry = pw_core_get_registry(d.core, PW_VERSION_REGISTRY, 0);
+    pw_registry_add_listener(d.registry, &d.registry_listener,
+                             &registry_events, &d);
+
+    /* Sync so we get the initial graph snapshot before proceeding */
+    d.pending_seq = pw_core_sync(d.core, PW_ID_CORE, 0);
+
+    /* MIDI filter node — receives MIDI CC from any connected source */
+    struct pw_properties *filter_props =
+        pw_properties_new(PW_KEY_MEDIA_TYPE,     "Midi",
+                          PW_KEY_MEDIA_CATEGORY, "Capture",
+                          PW_KEY_MEDIA_ROLE,     "Production",
+                          PW_KEY_NODE_NAME,      "midi-control",
+                          PW_KEY_NODE_DESCRIPTION, "MIDI Control Mapper",
+                          NULL);
+
+    mpd.filter = pw_filter_new(d.core, "midi-control", filter_props);
+    if (!mpd.filter) { log_error("Failed to create filter"); return 1; }
+
+    pw_filter_add_listener(mpd.filter, &mpd.filter_listener,
+                           &filter_events, &mpd);
+
+    /* Add a MIDI input port */
+    struct pw_properties *port_props =
+        pw_properties_new(PW_KEY_FORMAT_DSP, "8 bit raw midi",
+                          PW_KEY_PORT_NAME,  "midi_in",
+                          NULL);
+
+    mpd.in_port = pw_filter_add_port(
+        mpd.filter,
+        PW_DIRECTION_INPUT,
+        PW_FILTER_PORT_FLAG_MAP_BUFFERS,
+        0,
+        port_props,
+        NULL, 0);
+
+    if (!mpd.in_port) { log_error("Failed to add MIDI port"); return 1; }
+
+    if (pw_filter_connect(mpd.filter,
+                          PW_FILTER_FLAG_RT_PROCESS, NULL, 0) < 0) {
+        log_error("Failed to connect filter");
+        return 1;
+    }
+
+    /* Signal handlers for clean shutdown */
+    signal(SIGINT,  handle_signal);
+    signal(SIGTERM, handle_signal);
+
+    log_info("midi-control running. Connect a MIDI source to the "
+             "'midi-control' port in your session manager.");
+    log_info("Press Ctrl+C to quit.");
+
+    pw_main_loop_run(d.loop);
+
+    /* Cleanup */
+    log_verbose("Shutting down");
+    pw_filter_destroy(mpd.filter);
+    spa_hook_remove(&d.registry_listener);
+    pw_proxy_destroy((struct pw_proxy *)d.registry);
+    spa_hook_remove(&d.core_listener);
+    pw_core_disconnect(d.core);
+    pw_context_destroy(d.context);
+    pw_main_loop_destroy(d.loop);
+    pw_deinit();
+
     return 0;
 }
