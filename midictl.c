@@ -15,6 +15,7 @@
  * midi-control.c
  */
 
+#include <errno.h>
 #include <getopt.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -27,8 +28,10 @@
 #include <pipewire/pipewire.h>
 #include <spa/control/control.h>
 #include <spa/control/ump-utils.h>
+#include <spa/debug/types.h>
 #include <spa/param/buffers.h>
 #include <spa/param/format.h>
+#include <spa/param/props-types.h>
 #include <spa/param/props.h>
 #include <spa/pod/builder.h>
 #include <spa/pod/pod.h>
@@ -43,6 +46,11 @@
 #define MAX_PARAM_NAME 128
 #define MAX_NODE_NAME 128
 #define JSON_BUF_SIZE 65536
+
+/* MIDI constants */
+#define MIDI_STATUS_MASK 0xF0
+#define MIDI_CHANNEL_MASK 0x0F
+#define MIDI_CC_STATUS 0xB0
 
 /* --------------------------------------------------------------------------
  * Logging helpers
@@ -75,6 +83,7 @@ struct mapping {
 
   /* Resolved at runtime */
   uint32_t node_id;        /* pw_node id, or SPA_ID_INVALID */
+  uint32_t prop_id;        /* SPA property ID for direct properties */
   bool is_param;           /* true  -> Props { params: ["name", val] }
                               false -> Props { name: val }           */
   bool prop_info_resolved; /* have we queried PropInfo yet? */
@@ -85,6 +94,7 @@ struct param_update {
   struct pw_proxy *proxy;
   char param[MAX_PARAM_NAME];
   float value;
+  uint32_t prop_id;
   bool is_param;
 };
 
@@ -243,44 +253,41 @@ static double scale_midi(int midi_val, double out_min, double out_max) {
 /* Build and send a Props pod to set a single parameter on a node proxy.
  *
  * If is_param == true:   Props { params: [ "name", value ] }
- * If is_param == false:  Props { name: value }
+ * If is_param == false:  Props { prop_id: value }
  *
  * Must be called from the main loop thread. The RT process callback uses
  * do_set_node_param_invoke via pw_loop_invoke to get here safely.
  */
 static void set_node_param(struct pw_proxy *proxy, const char *param_name,
-                           float value, bool is_param) {
+                           float value, uint32_t prop_id, bool is_param) {
   uint8_t buf[512];
   struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
   struct spa_pod_frame f[2];
   struct spa_pod *pod;
 
-  /* Props { params: [ "name", <Float> ] }
-   *
-   * Must use a Struct pod (heterogeneous), not an Array pod (homogeneous),
-   * because the params value is a sequence of alternating string/float pairs.
-   */
   spa_pod_builder_push_object(&b, &f[0], SPA_TYPE_OBJECT_Props,
                               SPA_PARAM_Props);
-  spa_pod_builder_prop(&b, SPA_PROP_params, 0);
-  spa_pod_builder_push_struct(&b, &f[1]);
-  spa_pod_builder_string(&b, param_name);
-  spa_pod_builder_float(&b, value);
-  spa_pod_builder_pop(&b, &f[1]);
+
+  if (is_param) {
+    /* Props { params: [ "name", <Float> ] }
+     *
+     * Must use a Struct pod (heterogeneous), not an Array pod (homogeneous),
+     * because the params value is a sequence of alternating string/float pairs.
+     */
+    spa_pod_builder_prop(&b, SPA_PROP_params, 0);
+    spa_pod_builder_push_struct(&b, &f[1]);
+    spa_pod_builder_string(&b, param_name);
+    spa_pod_builder_float(&b, value);
+    spa_pod_builder_pop(&b, &f[1]);
+  } else {
+    /* Props { prop_id: <Float> } */
+    spa_pod_builder_prop(&b, prop_id, 0);
+    spa_pod_builder_float(&b, value);
+  }
+
   pod = spa_pod_builder_pop(&b, &f[0]);
 
-  int res = pw_node_set_param((struct pw_node *)proxy, SPA_PARAM_Props, 0, pod);
-  /*
-  if (verbose) {
-      fprintf(stderr, "[verbose] pw_node_set_param: res=%d (%s), pod size=%u\n",
-              res, spa_strerror(res), SPA_POD_SIZE(pod));
-      uint8_t *p = (uint8_t *)pod;
-      fprintf(stderr, "[verbose] pod bytes:");
-      for (uint32_t i = 0; i < SPA_POD_SIZE(pod) && i < 64; i++)
-          fprintf(stderr, " %02x", p[i]);
-      fprintf(stderr, "\n");
-  }
-  */
+  pw_node_set_param((struct pw_node *)proxy, SPA_PARAM_Props, 0, pod);
 }
 
 /* pw_loop_invoke callback — runs in the main loop thread */
@@ -292,21 +299,18 @@ static int do_set_node_param_invoke(struct spa_loop *loop, bool async,
   (void)seq;
   (void)size;
   const struct param_update *u = data;
-  /*
-  log_verbose("invoke: setting param='%s' value=%.4f on proxy %p",
-              u->param, u->value, (void *)u->proxy);
-  */
-  set_node_param(u->proxy, u->param, u->value, u->is_param);
+  set_node_param(u->proxy, u->param, u->value, u->prop_id, u->is_param);
   return 0;
 }
 
 /* Called from the RT process thread — dispatches to main loop */
 static void schedule_node_param(struct pw_loop *loop, struct pw_proxy *proxy,
                                 const char *param_name, float value,
-                                bool is_param) {
+                                uint32_t prop_id, bool is_param) {
   struct param_update u;
   u.proxy = proxy;
   u.value = value;
+  u.prop_id = prop_id;
   u.is_param = is_param;
   snprintf(u.param, sizeof(u.param), "%s", param_name);
   int res = pw_loop_invoke(loop, do_set_node_param_invoke, SPA_ID_INVALID, &u,
@@ -335,6 +339,26 @@ static void on_node_param(void *data, int seq, uint32_t id, uint32_t index,
   struct node_info *ni = data;
   struct data *d = ni->data;
 
+  /* Parse the PropInfo pod to extract id, name and params flag */
+  const char *name = NULL;
+  bool is_par = false;
+  uint32_t prop_id = SPA_ID_INVALID;
+
+  struct spa_pod_prop *prop;
+  SPA_POD_OBJECT_FOREACH((struct spa_pod_object *)param, prop) {
+    if (prop->key == SPA_PROP_INFO_id) {
+      if (spa_pod_get_id(&prop->value, &prop_id) < 0)
+        prop_id = SPA_ID_INVALID;
+    } else if (prop->key == SPA_PROP_INFO_name) {
+      if (spa_pod_get_string(&prop->value, &name) < 0)
+        name = NULL;
+    } else if (prop->key == SPA_PROP_INFO_params) {
+      bool v = false;
+      if (spa_pod_get_bool(&prop->value, &v) >= 0)
+        is_par = v;
+    }
+  }
+
   /* Iterate over all unresolved mappings for this node */
   for (int i = 0; i < d->n_mappings; i++) {
     struct mapping *m = &d->mappings[i];
@@ -343,27 +367,28 @@ static void on_node_param(void *data, int seq, uint32_t id, uint32_t index,
     if (m->prop_info_resolved)
       continue;
 
-    /* Parse the PropInfo pod to extract name and params flag */
-    const char *name = NULL;
-    bool is_par = false;
+    bool matched = false;
 
-    struct spa_pod_prop *prop;
-    SPA_POD_OBJECT_FOREACH((struct spa_pod_object *)param, prop) {
-      if (prop->key == SPA_PROP_INFO_name) {
-        if (spa_pod_get_string(&prop->value, &name) < 0)
-          name = NULL;
-      } else if (prop->key == SPA_PROP_INFO_params) {
-        bool v = false;
-        if (spa_pod_get_bool(&prop->value, &v) >= 0)
-          is_par = v;
+    /* Try matching by name (for params properties) */
+    if (name && strcmp(name, m->param) == 0) {
+      matched = true;
+    }
+    /* Try matching by property ID (for direct properties) */
+    else if (!name && prop_id != SPA_ID_INVALID) {
+      uint32_t lookup_id =
+          spa_debug_type_find_type_short(spa_type_props, m->param);
+      if (lookup_id != SPA_ID_INVALID && lookup_id == prop_id) {
+        matched = true;
       }
     }
 
-    if (name && strcmp(name, m->param) == 0) {
+    if (matched) {
       m->is_param = is_par;
+      m->prop_id = prop_id;
       m->prop_info_resolved = true;
-      log_verbose("Resolved PropInfo for '%s' on node %u: is_param=%s",
-                  m->param, ni->id, is_par ? "true" : "false");
+      log_verbose(
+          "Resolved PropInfo for '%s' on node %u: is_param=%s, prop_id=%u",
+          m->param, ni->id, is_par ? "true" : "false", prop_id);
     }
   }
 }
@@ -605,15 +630,6 @@ static void on_filter_process(void *userdata, struct spa_io_position *pos) {
       uint32_t size = SPA_POD_BODY_SIZE(&c->value);
       uint8_t ev[8];
 
-      /*
-      log_verbose("process: UMP bytes=%u: %02x %02x %02x %02x",
-                  size,
-                  size > 0 ? ((uint8_t*)ump)[0] : 0,
-                  size > 1 ? ((uint8_t*)ump)[1] : 0,
-                  size > 2 ? ((uint8_t*)ump)[2] : 0,
-                  size > 3 ? ((uint8_t*)ump)[3] : 0);
-      */
-
       int ev_size = spa_ump_to_midi(ump, size, ev, sizeof(ev));
       if (ev_size < 3)
         continue;
@@ -627,11 +643,11 @@ static void on_filter_process(void *userdata, struct spa_io_position *pos) {
     }
 
     status = midi[0];
-    msg_type = status & 0xF0;
-    channel = (status & 0x0F) + 1; /* make 1-based */
+    msg_type = status & MIDI_STATUS_MASK;
+    channel = (status & MIDI_CHANNEL_MASK) + 1; /* make 1-based */
 
-    /* We only care about Control Change (0xB0) */
-    if (msg_type != 0xB0)
+    /* We only care about Control Change */
+    if (msg_type != MIDI_CC_STATUS)
       continue;
 
     controller = midi[1];
@@ -664,16 +680,22 @@ static void on_filter_process(void *userdata, struct spa_io_position *pos) {
       if (!ni)
         continue;
 
+      if (!m->prop_info_resolved) {
+        log_verbose(
+            "PropInfo not resolved yet for ch=%d cc=%d param='%s', skipping",
+            m->channel, m->control, m->param);
+        continue;
+      }
+
       double scaled = scale_midi(value, m->min, m->max);
 
-      log_verbose("ch=%d cc=%d val=%d -> node='%s' "
-                  "param='%s' scaled=%.4f (is_param=%s)\n",
+      log_verbose("ch=%d cc=%d val=%d -> node='%s' param='%s' scaled=%.4f "
+                  "(is_param=%s)",
                   m->channel, m->control, value, m->node_name, m->param, scaled,
-                  m->prop_info_resolved ? (m->is_param ? "true" : "false")
-                                        : "unresolved");
+                  m->is_param ? "true" : "false");
 
       schedule_node_param(d->pw_loop, ni->proxy, m->param, (float)scaled,
-                          m->prop_info_resolved ? m->is_param : true);
+                          m->prop_id, m->is_param);
     }
   }
 
@@ -760,25 +782,30 @@ int main(int argc, char *argv[]) {
     return 1;
   d.n_mappings = n;
 
+  int ret = 0;
+
   /* Main loop + context + core */
   d.loop = pw_main_loop_new(NULL);
   if (!d.loop) {
     log_error("Failed to create main loop");
+    pw_deinit();
     return 1;
   }
   d.pw_loop = pw_main_loop_get_loop(d.loop);
   g_loop = d.loop;
 
-  d.context = pw_context_new(pw_main_loop_get_loop(d.loop), NULL, 0);
+  d.context = pw_context_new(d.pw_loop, NULL, 0);
   if (!d.context) {
     log_error("Failed to create context");
-    return 1;
+    ret = 1;
+    goto cleanup_loop;
   }
 
   d.core = pw_context_connect(d.context, NULL, 0);
   if (!d.core) {
     log_error("Failed to connect to PipeWire daemon");
-    return 1;
+    ret = 1;
+    goto cleanup_context;
   }
 
   pw_core_add_listener(d.core, &d.core_listener, &core_events, &d);
@@ -810,7 +837,8 @@ int main(int argc, char *argv[]) {
   mpd.filter = pw_filter_new(d.core, "midi-control", filter_props);
   if (!mpd.filter) {
     log_error("Failed to create filter");
-    return 1;
+    ret = 1;
+    goto cleanup_registry;
   }
 
   pw_filter_add_listener(mpd.filter, &mpd.filter_listener, &filter_events,
@@ -841,12 +869,14 @@ int main(int argc, char *argv[]) {
 
   if (!mpd.in_port) {
     log_error("Failed to add MIDI port");
-    return 1;
+    ret = 1;
+    goto cleanup_filter;
   }
 
   if (pw_filter_connect(mpd.filter, PW_FILTER_FLAG_RT_PROCESS, NULL, 0) < 0) {
     log_error("Failed to connect filter");
-    return 1;
+    ret = 1;
+    goto cleanup_filter;
   }
 
   /* Signal handlers for clean shutdown */
@@ -857,14 +887,19 @@ int main(int argc, char *argv[]) {
 
   /* Cleanup */
   log_verbose("Shutting down");
-  pw_filter_destroy(mpd.filter);
+cleanup_filter:
+  if (mpd.filter)
+    pw_filter_destroy(mpd.filter);
+cleanup_registry:
   spa_hook_remove(&d.registry_listener);
   pw_proxy_destroy((struct pw_proxy *)d.registry);
   spa_hook_remove(&d.core_listener);
   pw_core_disconnect(d.core);
+cleanup_context:
   pw_context_destroy(d.context);
+cleanup_loop:
   pw_main_loop_destroy(d.loop);
   pw_deinit();
 
-  return 0;
+  return ret;
 }
