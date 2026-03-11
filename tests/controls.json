@@ -1,0 +1,18 @@
+[
+	{
+		"channel": 1,
+		"control": 23,
+		"node": "gain.input",
+		"param": "gain:Gain 1",
+		"min": 0,
+		"max": 10
+	},
+	{
+		"channel": 1,
+		"control": 24,
+		"node": "gain.input",
+		"param": "volume",
+		"min": 0,
+		"max": 10
+	}
+]
