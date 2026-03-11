@@ -273,6 +273,7 @@ static void set_node_param(struct pw_proxy *proxy,
     pod = spa_pod_builder_pop(&b, &f[0]);
 
     int res = pw_node_set_param((struct pw_node *)proxy, SPA_PARAM_Props, 0, pod);
+    /*
     if (verbose) {
         fprintf(stderr, "[verbose] pw_node_set_param: res=%d (%s), pod size=%u\n",
                 res, spa_strerror(res), SPA_POD_SIZE(pod));
@@ -282,6 +283,7 @@ static void set_node_param(struct pw_proxy *proxy,
             fprintf(stderr, " %02x", p[i]);
         fprintf(stderr, "\n");
     }
+    */
 }
 
 /* pw_loop_invoke callback — runs in the main loop thread */
@@ -294,8 +296,10 @@ static int do_set_node_param_invoke(struct spa_loop *loop,
 {
     (void)loop; (void)async; (void)seq; (void)size;
     const struct param_update *u = data;
+    /*
     log_verbose("invoke: setting param='%s' value=%.4f on proxy %p",
                 u->param, u->value, (void *)u->proxy);
+    */
     set_node_param(u->proxy, u->param, u->value, u->is_param);
     return 0;
 }
@@ -623,12 +627,14 @@ static void on_filter_process(void *userdata, struct spa_io_position *pos)
             uint32_t  size = SPA_POD_BODY_SIZE(&c->value);
             uint8_t   ev[8];
 
+	    /*
             log_verbose("process: UMP bytes=%u: %02x %02x %02x %02x",
                         size,
                         size > 0 ? ((uint8_t*)ump)[0] : 0,
                         size > 1 ? ((uint8_t*)ump)[1] : 0,
                         size > 2 ? ((uint8_t*)ump)[2] : 0,
                         size > 3 ? ((uint8_t*)ump)[3] : 0);
+	    */
 
             int ev_size = spa_ump_to_midi(ump, size, ev, sizeof(ev));
             if (ev_size < 3) continue;
@@ -680,16 +686,13 @@ static void on_filter_process(void *userdata, struct spa_io_position *pos)
 
             double scaled = scale_midi(value, m->min, m->max);
 
-            if (verbose) {
-                fprintf(stderr,
-                        "[verbose] ch=%d cc=%d val=%d -> node='%s' "
-                        "param='%s' scaled=%.4f (is_param=%s)\n",
-                        m->channel, m->control, value,
-                        m->node_name, m->param, scaled,
-                        m->prop_info_resolved
-                            ? (m->is_param ? "true" : "false")
-                            : "unresolved");
-            }
+			log_verbose("ch=%d cc=%d val=%d -> node='%s' "
+					"param='%s' scaled=%.4f (is_param=%s)\n",
+					m->channel, m->control, value,
+					m->node_name, m->param, scaled,
+					m->prop_info_resolved
+						? (m->is_param ? "true" : "false")
+						: "unresolved");
 
             schedule_node_param(d->pw_loop, ni->proxy, m->param, (float)scaled,
                                 m->prop_info_resolved ? m->is_param : true);
@@ -733,9 +736,9 @@ static void handle_signal(int sig)
 /* --------------------------------------------------------------------------
  * Usage / main
  * -------------------------------------------------------------------------- */
-static void usage(const char *prog)
+static void usage(const char *prog, FILE *out)
 {
-    fprintf(stderr,
+    fprintf(out,
             "Usage: %s [OPTIONS] [config-file]\n"
             "\n"
             "Listen for MIDI CC events and map them to PipeWire node parameters.\n"
@@ -760,8 +763,8 @@ int main(int argc, char *argv[])
     while ((opt = getopt_long(argc, argv, "vh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'v': verbose = true; break;
-        case 'h': usage(argv[0]); return 0;
-        default:  usage(argv[0]); return 1;
+        case 'h': usage(argv[0], stdout); return 0;
+        default:  usage(argv[0], stderr); return 1;
         }
     }
 
@@ -865,10 +868,6 @@ int main(int argc, char *argv[])
     /* Signal handlers for clean shutdown */
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
-
-    log_info("midi-control running. Connect a MIDI source to the "
-             "'midi-control' port in your session manager.");
-    log_info("Press Ctrl+C to quit.");
 
     pw_main_loop_run(d.loop);
 
