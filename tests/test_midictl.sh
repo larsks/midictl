@@ -21,7 +21,7 @@ fi
 midictl_pid=$!
 wpexec tests/gain.lua >&tests/wpexec.log &
 wpexec_pid=$!
-trap "kill $midictl_pid $wpexec_pid" exit
+trap "kill $midictl_pid $wpexec_pid; wait" EXIT
 
 # wait for midictl port to show up
 echo -n "waiting for midictl: "
