@@ -19,6 +19,7 @@
 #include <getopt.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,11 +52,14 @@
 #define MIDI_STATUS_MASK 0xF0
 #define MIDI_CHANNEL_MASK 0x0F
 #define MIDI_CC_STATUS 0xB0
+#define MIDI_MAX_VALUE 127
+#define MIDI_CC_MIN_BYTES 3
 
 /* --------------------------------------------------------------------------
- * Logging helpers
+ * Logging helpers and signal handling
  * -------------------------------------------------------------------------- */
 static bool verbose = false;
+static atomic_bool shutdown_requested = false;
 
 #define log_verbose(fmt, ...)                                                  \
   do {                                                                         \
@@ -243,7 +247,43 @@ static int load_config(const char *path, struct mapping *mappings,
  * Value scaling
  * -------------------------------------------------------------------------- */
 static double scale_midi(int midi_val, double out_min, double out_max) {
-  return out_min + (out_max - out_min) * (midi_val / 127.0);
+  return out_min + (out_max - out_min) * (midi_val / (double)MIDI_MAX_VALUE);
+}
+
+/* --------------------------------------------------------------------------
+ * Helper functions for node and mapping lookups
+ * -------------------------------------------------------------------------- */
+
+/* Find a node_info by node ID. Returns NULL if not found. */
+static struct node_info *find_node_by_id(struct data *d, uint32_t node_id) {
+  for (int i = 0; i < d->n_nodes; i++) {
+    if (d->nodes[i].id == node_id)
+      return &d->nodes[i];
+  }
+  return NULL;
+}
+
+/* Check if a mapping is ready to handle MIDI events */
+static bool is_mapping_ready(struct mapping *m) {
+  return m->node_id != SPA_ID_INVALID && m->prop_info_resolved;
+}
+
+/* Check if a mapping matches a PropInfo pod. Encapsulates matching logic. */
+static bool mapping_matches_propinfo(struct mapping *m, const char *name,
+                                     uint32_t prop_id) {
+  /* Try matching by name (for params properties) */
+  if (name && strcmp(name, m->param) == 0) {
+    return true;
+  }
+  /* Try matching by property ID (for direct properties) */
+  if (!name && prop_id != SPA_ID_INVALID) {
+    uint32_t lookup_id =
+        spa_debug_type_find_type_short(spa_type_props, m->param);
+    if (lookup_id != SPA_ID_INVALID && lookup_id == prop_id) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /* --------------------------------------------------------------------------
@@ -260,7 +300,7 @@ static double scale_midi(int midi_val, double out_min, double out_max) {
  */
 static void set_node_param(struct pw_proxy *proxy, const char *param_name,
                            float value, uint32_t prop_id, bool is_param) {
-  uint8_t buf[512];
+  uint8_t buf[512]; /* sufficient for Props pod with param name and value */
   struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
   struct spa_pod_frame f[2];
   struct spa_pod *pod;
@@ -316,7 +356,7 @@ static void schedule_node_param(struct pw_loop *loop, struct pw_proxy *proxy,
   int res = pw_loop_invoke(loop, do_set_node_param_invoke, SPA_ID_INVALID, &u,
                            sizeof(u), false, NULL);
   if (res < 0)
-    fprintf(stderr, "[error]   pw_loop_invoke failed: %s\n", spa_strerror(res));
+    log_error("pw_loop_invoke failed: %s", spa_strerror(res));
 }
 
 /* --------------------------------------------------------------------------
@@ -341,7 +381,7 @@ static void on_node_param(void *data, int seq, uint32_t id, uint32_t index,
 
   /* Parse the PropInfo pod to extract id, name and params flag */
   const char *name = NULL;
-  bool is_par = false;
+  bool is_param = false;
   uint32_t prop_id = SPA_ID_INVALID;
 
   struct spa_pod_prop *prop;
@@ -355,7 +395,7 @@ static void on_node_param(void *data, int seq, uint32_t id, uint32_t index,
     } else if (prop->key == SPA_PROP_INFO_params) {
       bool v = false;
       if (spa_pod_get_bool(&prop->value, &v) >= 0)
-        is_par = v;
+        is_param = v;
     }
   }
 
@@ -367,28 +407,13 @@ static void on_node_param(void *data, int seq, uint32_t id, uint32_t index,
     if (m->prop_info_resolved)
       continue;
 
-    bool matched = false;
-
-    /* Try matching by name (for params properties) */
-    if (name && strcmp(name, m->param) == 0) {
-      matched = true;
-    }
-    /* Try matching by property ID (for direct properties) */
-    else if (!name && prop_id != SPA_ID_INVALID) {
-      uint32_t lookup_id =
-          spa_debug_type_find_type_short(spa_type_props, m->param);
-      if (lookup_id != SPA_ID_INVALID && lookup_id == prop_id) {
-        matched = true;
-      }
-    }
-
-    if (matched) {
-      m->is_param = is_par;
+    if (mapping_matches_propinfo(m, name, prop_id)) {
+      m->is_param = is_param;
       m->prop_id = prop_id;
       m->prop_info_resolved = true;
       log_verbose(
           "Resolved PropInfo for '%s' on node %u: is_param=%s, prop_id=%u",
-          m->param, ni->id, is_par ? "true" : "false", prop_id);
+          m->param, ni->id, is_param ? "true" : "false", prop_id);
     }
   }
 }
@@ -583,6 +608,85 @@ struct midi_port_data {
   void *in_port; /* input MIDI port handle */
 };
 
+/* Extract MIDI CC message from control pod. Returns true if valid CC message.
+ */
+static bool extract_midi_cc_from_control(struct spa_pod_control *c,
+                                         uint8_t out_midi[3]) {
+  if (c->type == SPA_CONTROL_Midi) {
+    uint8_t *raw = SPA_POD_BODY(&c->value);
+    uint32_t size = SPA_POD_BODY_SIZE(&c->value);
+
+    log_verbose("process: MIDI bytes=%u: %02x %02x %02x", size,
+                size > 0 ? raw[0] : 0, size > 1 ? raw[1] : 0,
+                size > 2 ? raw[2] : 0);
+
+    if (size < MIDI_CC_MIN_BYTES)
+      return false;
+    out_midi[0] = raw[0];
+    out_midi[1] = raw[1];
+    out_midi[2] = raw[2];
+    return true;
+
+  } else if (c->type == SPA_CONTROL_UMP) {
+    uint32_t *ump = SPA_POD_BODY(&c->value);
+    uint32_t size = SPA_POD_BODY_SIZE(&c->value);
+    uint8_t ev[8];
+
+    int ev_size = spa_ump_to_midi(ump, size, ev, sizeof(ev));
+    if (ev_size < MIDI_CC_MIN_BYTES)
+      return false;
+
+    out_midi[0] = ev[0];
+    out_midi[1] = ev[1];
+    out_midi[2] = ev[2];
+    return true;
+  }
+
+  return false;
+}
+
+/* Process a single MIDI CC message by finding and applying matching mappings.
+ */
+static void process_midi_cc(struct data *d, uint8_t channel, uint8_t controller,
+                            uint8_t value) {
+  log_verbose("MIDI CC: channel=%u controller=%u value=%u", channel, controller,
+              value);
+
+  for (int i = 0; i < d->n_mappings; i++) {
+    struct mapping *m = &d->mappings[i];
+
+    if (m->channel != (int)channel || m->control != (int)controller)
+      continue;
+
+    if (m->node_id == SPA_ID_INVALID) {
+      log_verbose("No node for mapping ch=%d cc=%d yet, skipping", m->channel,
+                  m->control);
+      continue;
+    }
+
+    if (!is_mapping_ready(m)) {
+      log_verbose(
+          "PropInfo not resolved yet for ch=%d cc=%d param='%s', skipping",
+          m->channel, m->control, m->param);
+      continue;
+    }
+
+    struct node_info *ni = find_node_by_id(d, m->node_id);
+    if (!ni)
+      continue;
+
+    double scaled = scale_midi(value, m->min, m->max);
+
+    log_verbose("ch=%d cc=%d val=%d -> node='%s' param='%s' scaled=%.4f "
+                "(is_param=%s)",
+                m->channel, m->control, value, m->node_name, m->param, scaled,
+                m->is_param ? "true" : "false");
+
+    schedule_node_param(d->pw_loop, ni->proxy, m->param, (float)scaled,
+                        m->prop_id, m->is_param);
+  }
+}
+
 static void on_filter_process(void *userdata, struct spa_io_position *pos) {
   struct midi_port_data *mpd = userdata;
   struct data *d = mpd->app;
@@ -598,7 +702,6 @@ static void on_filter_process(void *userdata, struct spa_io_position *pos) {
   if (!sbuf->datas[0].data || chunk_size == 0)
     goto done;
 
-  /* The actual data starts at chunk->offset within the data pointer */
   void *raw =
       SPA_PTROFF(sbuf->datas[0].data, sbuf->datas[0].chunk->offset, void);
   struct spa_pod *pod = raw;
@@ -608,95 +711,22 @@ static void on_filter_process(void *userdata, struct spa_io_position *pos) {
 
   struct spa_pod_control *c;
   SPA_POD_SEQUENCE_FOREACH((struct spa_pod_sequence *)pod, c) {
-    uint8_t status, msg_type, channel, controller, value;
     uint8_t midi[3];
 
-    if (c->type == SPA_CONTROL_Midi) {
-      uint8_t *raw = SPA_POD_BODY(&c->value);
-      uint32_t size = SPA_POD_BODY_SIZE(&c->value);
-
-      log_verbose("process: MIDI bytes=%u: %02x %02x %02x", size,
-                  size > 0 ? raw[0] : 0, size > 1 ? raw[1] : 0,
-                  size > 2 ? raw[2] : 0);
-
-      if (size < 3)
-        continue;
-      midi[0] = raw[0];
-      midi[1] = raw[1];
-      midi[2] = raw[2];
-
-    } else if (c->type == SPA_CONTROL_UMP) {
-      uint32_t *ump = SPA_POD_BODY(&c->value);
-      uint32_t size = SPA_POD_BODY_SIZE(&c->value);
-      uint8_t ev[8];
-
-      int ev_size = spa_ump_to_midi(ump, size, ev, sizeof(ev));
-      if (ev_size < 3)
-        continue;
-
-      midi[0] = ev[0];
-      midi[1] = ev[1];
-      midi[2] = ev[2];
-
-    } else {
+    if (!extract_midi_cc_from_control(c, midi))
       continue;
-    }
 
-    status = midi[0];
-    msg_type = status & MIDI_STATUS_MASK;
-    channel = (status & MIDI_CHANNEL_MASK) + 1; /* make 1-based */
+    uint8_t status = midi[0];
+    uint8_t msg_type = status & MIDI_STATUS_MASK;
+    uint8_t channel = (status & MIDI_CHANNEL_MASK) + 1;
 
-    /* We only care about Control Change */
     if (msg_type != MIDI_CC_STATUS)
       continue;
 
-    controller = midi[1];
-    value = midi[2];
+    uint8_t controller = midi[1];
+    uint8_t value = midi[2];
 
-    log_verbose("MIDI CC: channel=%u controller=%u value=%u", channel,
-                controller, value);
-
-    /* Find matching mappings */
-    for (int i = 0; i < d->n_mappings; i++) {
-      struct mapping *m = &d->mappings[i];
-
-      if (m->channel != (int)channel || m->control != (int)controller)
-        continue;
-
-      if (m->node_id == SPA_ID_INVALID) {
-        log_verbose("No node for mapping ch=%d cc=%d yet, skipping", m->channel,
-                    m->control);
-        continue;
-      }
-
-      /* Find the node_info for this mapping */
-      struct node_info *ni = NULL;
-      for (int j = 0; j < d->n_nodes; j++) {
-        if (d->nodes[j].id == m->node_id) {
-          ni = &d->nodes[j];
-          break;
-        }
-      }
-      if (!ni)
-        continue;
-
-      if (!m->prop_info_resolved) {
-        log_verbose(
-            "PropInfo not resolved yet for ch=%d cc=%d param='%s', skipping",
-            m->channel, m->control, m->param);
-        continue;
-      }
-
-      double scaled = scale_midi(value, m->min, m->max);
-
-      log_verbose("ch=%d cc=%d val=%d -> node='%s' param='%s' scaled=%.4f "
-                  "(is_param=%s)",
-                  m->channel, m->control, value, m->node_name, m->param, scaled,
-                  m->is_param ? "true" : "false");
-
-      schedule_node_param(d->pw_loop, ni->proxy, m->param, (float)scaled,
-                          m->prop_id, m->is_param);
-    }
+    process_midi_cc(d, channel, controller, value);
   }
 
 done:
@@ -720,12 +750,10 @@ static const struct pw_filter_events filter_events = {
 /* --------------------------------------------------------------------------
  * Signal handling
  * -------------------------------------------------------------------------- */
-static struct pw_main_loop *g_loop = NULL;
 
 static void handle_signal(int sig) {
   (void)sig;
-  if (g_loop)
-    pw_main_loop_quit(g_loop);
+  atomic_store(&shutdown_requested, true);
 }
 
 /* --------------------------------------------------------------------------
@@ -792,7 +820,6 @@ int main(int argc, char *argv[]) {
     return 1;
   }
   d.pw_loop = pw_main_loop_get_loop(d.loop);
-  g_loop = d.loop;
 
   d.context = pw_context_new(d.pw_loop, NULL, 0);
   if (!d.context) {
@@ -810,8 +837,12 @@ int main(int argc, char *argv[]) {
 
   pw_core_add_listener(d.core, &d.core_listener, &core_events, &d);
 
-  /* Registry */
   d.registry = pw_core_get_registry(d.core, PW_VERSION_REGISTRY, 0);
+  if (!d.registry) {
+    log_error("Failed to get registry");
+    ret = 1;
+    goto cleanup_core;
+  }
   pw_registry_add_listener(d.registry, &d.registry_listener, &registry_events,
                            &d);
 
@@ -845,7 +876,7 @@ int main(int argc, char *argv[]) {
                          &mpd);
 
   /* Build port params: EnumFormat + Buffers in one pod array */
-  uint8_t pod_buf[1024];
+  uint8_t pod_buf[1024]; /* sufficient for 2 parameter pods */
   struct spa_pod_builder pb = SPA_POD_BUILDER_INIT(pod_buf, sizeof(pod_buf));
   const struct spa_pod *port_params[2];
 
@@ -883,20 +914,37 @@ int main(int argc, char *argv[]) {
   signal(SIGINT, handle_signal);
   signal(SIGTERM, handle_signal);
 
-  pw_main_loop_run(d.loop);
+  /* Run until shutdown_requested is set by signal handler */
+  while (!atomic_load(&shutdown_requested)) {
+    pw_loop_iterate(d.pw_loop, -1);
+  }
 
-  /* Cleanup */
   log_verbose("Shutting down");
+
 cleanup_filter:
   if (mpd.filter)
     pw_filter_destroy(mpd.filter);
 cleanup_registry:
-  spa_hook_remove(&d.registry_listener);
-  pw_proxy_destroy((struct pw_proxy *)d.registry);
-  spa_hook_remove(&d.core_listener);
-  pw_core_disconnect(d.core);
+  if (d.registry) {
+    spa_hook_remove(&d.registry_listener);
+    pw_proxy_destroy((struct pw_proxy *)d.registry);
+  }
+cleanup_core:
+  if (d.core) {
+    spa_hook_remove(&d.core_listener);
+    pw_core_disconnect(d.core);
+  }
+  /* Clean up tracked nodes */
+  for (int i = 0; i < d.n_nodes; i++) {
+    if (d.nodes[i].proxy) {
+      spa_hook_remove(&d.nodes[i].proxy_listener);
+      spa_hook_remove(&d.nodes[i].node_listener);
+      pw_proxy_destroy(d.nodes[i].proxy);
+    }
+  }
 cleanup_context:
-  pw_context_destroy(d.context);
+  if (d.context)
+    pw_context_destroy(d.context);
 cleanup_loop:
   pw_main_loop_destroy(d.loop);
   pw_deinit();
