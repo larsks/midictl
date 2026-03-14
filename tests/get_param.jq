@@ -26,4 +26,4 @@ def find_in_params($key):
   end
 ] |
 map(select(. != null)) |
-first // null
+if length > 0 then .[0] else null end

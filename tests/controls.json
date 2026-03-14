@@ -14,5 +14,20 @@
 		"param": "volume",
 		"min": 0,
 		"max": 10
+	},
+	{
+		"channel": 1,
+		"control": 25,
+		"node": "gain.input",
+		"param": "mute",
+		"button": true
+	},
+	{
+		"channel": 1,
+		"control": 26,
+		"node": "gain.input",
+		"param": "mute",
+		"button": true,
+		"invert": true
 	}
 ]

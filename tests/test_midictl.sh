@@ -40,6 +40,8 @@ if ! timeout 10 sh -c 'while ! pw-link -io | grep -q gain.input; do sleep 1; don
 fi
 echo ok
 
+#PS1="DEBUG> " bash --norc
+
 # link midi input to midictl
 pw-link 'Midi-Bridge:Midi Through Port-0 (capture)' 'midi-control:midi_in'
 
@@ -50,6 +52,7 @@ echo "found gain.input with id $nodeid"
 # reset test parameters
 echo "resetting parameters to known values"
 pw-cli set-param "$nodeid" 2 '{"volume": 1.0}' >/dev/null
+pw-cli set-param "$nodeid" 2 '{"mute": false}' >/dev/null
 pw-cli set-param "$nodeid" 2 '{"params": ["gain:Gain 1", 1.0]}' >/dev/null
 
 echo -n "checking initial value of gain:Gain 1: "
@@ -79,6 +82,42 @@ sleep 2
 echo -n "checking value of volume: "
 if ! check_prop_val volume 10.000000; then
   echo "ERROR: failed to set direct property value" >&2
+  exit 1
+fi
+
+echo "sending midi cc 25 (button/mute) with value 127 -> expect mute=true (1)"
+sendmidi dev 'Midi Through Port-0' cc 25 127
+sleep 2
+echo -n "checking value of mute (button, cc=127): "
+if ! check_prop_val mute true; then
+  echo "ERROR: button mapping (cc=127) did not set mute=true" >&2
+  exit 1
+fi
+
+echo "sending midi cc 25 (button/mute) with value 0 -> expect mute=false (0)"
+sendmidi dev 'Midi Through Port-0' cc 25 0
+sleep 2
+echo -n "checking value of mute (button, cc=0): "
+if ! check_prop_val mute false; then
+  echo "ERROR: button mapping (cc=0) did not set mute=false" >&2
+  exit 1
+fi
+
+echo "sending midi cc 26 (button+invert/mute) with value 127 -> expect mute=false (0)"
+sendmidi dev 'Midi Through Port-0' cc 26 127
+sleep 2
+echo -n "checking value of mute (button+invert, cc=127): "
+if ! check_prop_val mute false; then
+  echo "ERROR: button+invert mapping (cc=127) did not set mute=false" >&2
+  exit 1
+fi
+
+echo "sending midi cc 26 (button+invert/mute) with value 0 -> expect mute=true (1)"
+sendmidi dev 'Midi Through Port-0' cc 26 0
+sleep 2
+echo -n "checking value of mute (button+invert, cc=0): "
+if ! check_prop_val mute true; then
+  echo "ERROR: button+invert mapping (cc=0) did not set mute=true" >&2
   exit 1
 fi
 

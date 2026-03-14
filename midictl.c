@@ -91,6 +91,8 @@ struct mapping {
   bool is_param;           /* true  -> Props { params: ["name", val] }
                               false -> Props { name: val }           */
   bool prop_info_resolved; /* have we queried PropInfo yet? */
+  bool button;             /* if true, min=0 max=1 (0/1 range) */
+  bool invert;             /* if true (requires button), invert: 0->1, 1->0 */
 };
 
 /* Carries a parameter update from the RT process thread to the main loop */
@@ -100,6 +102,7 @@ struct param_update {
   float value;
   uint32_t prop_id;
   bool is_param;
+  bool is_button; /* if true, send Bool pod instead of Float */
 };
 
 /* One tracked PipeWire node */
@@ -218,6 +221,10 @@ static int load_config(const char *path, struct mapping *mappings,
           m->max = (double)fv;
           have_max = true;
         }
+      } else if (strcmp(key, "button") == 0) {
+        spa_json_get_bool(&obj, &m->button);
+      } else if (strcmp(key, "invert") == 0) {
+        spa_json_get_bool(&obj, &m->invert);
       } else {
         /* skip unknown key's value */
         const char *val;
@@ -225,16 +232,38 @@ static int load_config(const char *path, struct mapping *mappings,
       }
     }
 
-    if (!have_channel || !have_control || !have_node || !have_param ||
-        !have_min || !have_max) {
+    if (!have_channel || !have_control || !have_node || !have_param) {
       log_warn("Skipping incomplete mapping entry (need channel, control, "
-               "node, param, min, max)");
+               "node, param)");
       continue;
     }
 
-    log_verbose("Loaded mapping: ch=%d cc=%d node='%s' param='%s' "
-                "min=%.4f max=%.4f",
-                m->channel, m->control, m->node_name, m->param, m->min, m->max);
+    if (m->button && (have_min || have_max)) {
+      log_error("Mapping ch=%d cc=%d: 'button' cannot be combined with "
+                "'min' or 'max'",
+                m->channel, m->control);
+      continue;
+    }
+
+    if (m->invert && !m->button) {
+      log_error("Mapping ch=%d cc=%d: 'invert' requires 'button'", m->channel,
+                m->control);
+      continue;
+    }
+
+    if (m->button) {
+      m->min = 0.0;
+      m->max = 1.0;
+    } else if (!have_min || !have_max) {
+      log_warn(
+          "Skipping incomplete mapping entry (need min and max, or button)");
+      continue;
+    }
+
+    log_info("Loaded mapping: ch=%d cc=%d node='%s' param='%s' "
+             "min=%.4f max=%.4f button=%s invert=%s",
+             m->channel, m->control, m->node_name, m->param, m->min, m->max,
+             m->button ? "true" : "false", m->invert ? "true" : "false");
     count++;
   }
 
@@ -299,7 +328,8 @@ static bool mapping_matches_propinfo(struct mapping *m, const char *name,
  * do_set_node_param_invoke via pw_loop_invoke to get here safely.
  */
 static void set_node_param(struct pw_proxy *proxy, const char *param_name,
-                           float value, uint32_t prop_id, bool is_param) {
+                           float value, uint32_t prop_id, bool is_param,
+                           bool is_button) {
   uint8_t buf[512]; /* sufficient for Props pod with param name and value */
   struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
   struct spa_pod_frame f[2];
@@ -319,6 +349,10 @@ static void set_node_param(struct pw_proxy *proxy, const char *param_name,
     spa_pod_builder_string(&b, param_name);
     spa_pod_builder_float(&b, value);
     spa_pod_builder_pop(&b, &f[1]);
+  } else if (is_button) {
+    /* Props { prop_id: <Bool> } — boolean properties need a Bool pod */
+    spa_pod_builder_prop(&b, prop_id, 0);
+    spa_pod_builder_bool(&b, value >= 0.5f);
   } else {
     /* Props { prop_id: <Float> } */
     spa_pod_builder_prop(&b, prop_id, 0);
@@ -339,19 +373,22 @@ static int do_set_node_param_invoke(struct spa_loop *loop, bool async,
   (void)seq;
   (void)size;
   const struct param_update *u = data;
-  set_node_param(u->proxy, u->param, u->value, u->prop_id, u->is_param);
+  set_node_param(u->proxy, u->param, u->value, u->prop_id, u->is_param,
+                 u->is_button);
   return 0;
 }
 
 /* Called from the RT process thread — dispatches to main loop */
 static void schedule_node_param(struct pw_loop *loop, struct pw_proxy *proxy,
                                 const char *param_name, float value,
-                                uint32_t prop_id, bool is_param) {
+                                uint32_t prop_id, bool is_param,
+                                bool is_button) {
   struct param_update u;
   u.proxy = proxy;
   u.value = value;
   u.prop_id = prop_id;
   u.is_param = is_param;
+  u.is_button = is_button;
   snprintf(u.param, sizeof(u.param), "%s", param_name);
   int res = pw_loop_invoke(loop, do_set_node_param_invoke, SPA_ID_INVALID, &u,
                            sizeof(u), false, NULL);
@@ -677,13 +714,16 @@ static void process_midi_cc(struct data *d, uint8_t channel, uint8_t controller,
 
     double scaled = scale_midi(value, m->min, m->max);
 
+    if (m->invert)
+      scaled = 1.0 - scaled;
+
     log_verbose("ch=%d cc=%d val=%d -> node='%s' param='%s' scaled=%.4f "
                 "(is_param=%s)",
                 m->channel, m->control, value, m->node_name, m->param, scaled,
                 m->is_param ? "true" : "false");
 
     schedule_node_param(d->pw_loop, ni->proxy, m->param, (float)scaled,
-                        m->prop_id, m->is_param);
+                        m->prop_id, m->is_param, m->button);
   }
 }
 
